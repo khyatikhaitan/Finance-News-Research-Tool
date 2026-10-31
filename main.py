@@ -3,6 +3,9 @@
 import os
 import re
 from pathlib import Path
+import json
+from langchain_core.documents import Document
+from rank_bm25 import BM25Okapi
 
 # WebBaseLoader reads USER_AGENT when its module is imported.
 os.environ.setdefault("USER_AGENT", "FinanceNewsResearchTool/1.0")
@@ -27,6 +30,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 INDEX_DIR = PROJECT_DIR / "faiss_index"
+CHUNKS_FILE = INDEX_DIR / "chunks.json"
 
 # main.py lives in Research Tool/notebooks/. The .env can be in either folder.
 ENV_IN_NOTEBOOKS = PROJECT_DIR / "notebooks" / ".env"
@@ -125,6 +129,13 @@ if process_clicked:
             status.info("Creating embeddings and the FAISS index...")
             vector_store = FAISS.from_documents(chunks, get_embeddings())
             vector_store.save_local(str(INDEX_DIR))
+            CHUNKS_FILE.write_text(
+                json.dumps([
+                    {"text": doc.page_content, "metadata": doc.metadata}
+                    for doc in chunks
+                ]),
+                encoding="utf-8",
+            )
             # Old answers were about the old articles, so start a fresh chat.
             st.session_state.messages = []
             status.success(
@@ -176,7 +187,7 @@ ANSWER_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "{question}"),
 ])
 
-CITATION_PATTERN = r"\[(\d+(?:\s*,\s*\d+)*)\]"
+CITATION_PATTERN = r"[\[【](\d+(?:\s*,\s*\d+)*)[\]】]"
 
 
 def find_citations(answer, n_excerpts):
@@ -201,6 +212,63 @@ def to_langchain_history(messages):
         ("human" if m["role"] == "user" else "ai", m["content"], remove_citations(m["content"]))
         for m in recent
     ]
+
+STOPWORDS = {
+    "a", "an", "and", "any", "are", "as", "at", "be", "by", "did", "do", "does",
+    "for", "from", "has", "have", "how", "in", "is", "it", "its", "of", "on",
+    "or", "that", "the", "their", "they", "this", "to", "was", "were", "what",
+    "when", "which", "who", "why", "will", "with",
+}
+
+
+def tokenize(text):
+    """Lowercase words, keeping decimals like 4.5, minus common filler words."""
+    words = re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", text.lower())
+    return [w for w in words if w not in STOPWORDS]
+
+
+@st.cache_resource
+def load_keyword_index(index_mtime: float):
+    """Load the saved chunks and build the BM25 keyword index once."""
+    saved = json.loads(CHUNKS_FILE.read_text(encoding="utf-8"))
+    docs = [Document(page_content=c["text"], metadata=c["metadata"]) for c in saved]
+    bm25 = BM25Okapi([tokenize(d.page_content) for d in docs])
+    return docs, bm25
+
+
+def keyword_search(query, docs, bm25, k):
+    scores = bm25.get_scores(tokenize(query))
+    best_first = sorted(range(len(docs)), key=lambda i: scores[i], reverse=True)
+    return [docs[i] for i in best_first[:k] if scores[i] > 0]
+
+def merge_results(result_lists, k=4, rrf_k=60, max_per_article=2):
+    """Reciprocal Rank Fusion, keeping at most 2 chunks from any one article."""
+    scores, docs_by_text = {}, {}
+    for results in result_lists:
+        for rank, doc in enumerate(results, start=1):
+            docs_by_text[doc.page_content] = doc
+            scores[doc.page_content] = scores.get(doc.page_content, 0) + 1 / (rrf_k + rank)
+
+    picked, held_back, per_article = [], [], {}
+    for text in sorted(scores, key=scores.get, reverse=True):
+        doc = docs_by_text[text]
+        source = doc.metadata.get("source", "")
+        if per_article.get(source, 0) < max_per_article:
+            picked.append(doc)
+            per_article[source] = per_article.get(source, 0) + 1
+        else:
+            held_back.append(doc)
+        if len(picked) == k:
+            break
+
+    picked += held_back[: k - len(picked)]
+    return picked
+
+search_mode = st.sidebar.radio(
+    "Search mode",
+    ["Hybrid", "Meaning only", "Keywords only"],
+    help="Hybrid combines meaning-based search with keyword search.",
+)
 
 
 def condense_question(question, history):
@@ -241,7 +309,7 @@ for message in st.session_state.messages:
                 st.caption(f"Searched for: {message['search_query']}")
             show_excerpts(message.get("excerpts", []), message.get("cited", []))
 
-index_ready = (INDEX_DIR / "index.faiss").is_file()
+index_ready = (INDEX_DIR / "index.faiss").is_file() and CHUNKS_FILE.is_file()
 if not index_ready:
     st.info("Add news article URLs in the sidebar and click Process URLs to start.")
 
@@ -262,7 +330,18 @@ if question and question.strip():
             vector_store = load_vector_store(
                 (INDEX_DIR / "index.faiss").stat().st_mtime
             )
-            matches = vector_store.similarity_search(search_query, k=4)
+            index_mtime = (INDEX_DIR / "index.faiss").stat().st_mtime
+
+            meaning_results, keyword_results = [], []
+            if search_mode in ("Hybrid", "Meaning only"):
+                vector_store = load_vector_store(index_mtime)
+                meaning_results = vector_store.similarity_search(search_query, k=10)
+            if search_mode in ("Hybrid", "Keywords only"):
+                docs, bm25 = load_keyword_index(index_mtime)
+                keyword_results = keyword_search(search_query, docs, bm25, k=10)
+
+            matches = merge_results([meaning_results, keyword_results], k=4)
+            st.caption(f"Mode: {search_mode} · meaning found {len(meaning_results)} · keywords found {len(keyword_results)}")
 
             if not matches:
                 answer = "No matching information was found in the articles."
