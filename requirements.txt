@@ -8,3 +8,4 @@ langchain-text-splitters
 faiss-cpu
 sentence-transformers
 beautifulsoup4
+rank-bm25
