@@ -206,10 +206,16 @@ def remove_citations(text):
     return re.sub(r"\s*" + CITATION_PATTERN, "", text)
 
 def to_langchain_history(messages):
-    """Recent chat messages as (role, text) pairs for MessagesPlaceholder."""
+    """Recent chat messages as (role, text) pairs for MessagesPlaceholder.
+
+    Each pair must have exactly two items. Old answers have their [1], [2]
+    markers removed, because excerpt numbers restart on every question and
+    would point at the wrong excerpts.
+    """
     recent = messages[-MAX_HISTORY_MESSAGES:]
     return [
-        ("human" if m["role"] == "user" else "ai", m["content"], remove_citations(m["content"]))
+        ("human", m["content"]) if m["role"] == "user"
+        else ("ai", remove_citations(m["content"]))
         for m in recent
     ]
 
